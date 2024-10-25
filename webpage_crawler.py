@@ -8,6 +8,7 @@ import os
 
 
 
+
 class WikipediaCrawlerWithCMAB:
     def __init__(self, start_uri, subject, size_budget_kib, depth_limit=3, epsilon=0.1, epsilon_decay=0.99, min_epsilon=0.05):
         """
@@ -45,7 +46,7 @@ class WikipediaCrawlerWithCMAB:
             return None
         
     #-----------------------------------------------------------
-    # Extracting  valid Wikipedia links from the page.
+    # Extracting valid Wikipedia links from the page.
     def extract_wiki_links(self, soup):
         links = []
         for a_tag in soup.find_all('a', href=True):
@@ -59,10 +60,9 @@ class WikipediaCrawlerWithCMAB:
     def get_page_size(self, page_content):
         return len(page_content.encode('utf-8'))
 
-
     #-----------------------------------------------------------
-    def bfs_crawl(self, agent, metrics):
-        """Crawl Wikipedia using BFS and the provided agent (epsilon-greedy or UCB)."""
+    # Crawling using hybrid BFS/DFS methods
+    def bfs_crawl(self, agent, metrics, high_similarity_threshold=0.2):
 
         # Initialize a queue for BFS: each element is a tuple (uri, depth)
         queue = deque([(self.start_uri, 0)])
@@ -82,37 +82,32 @@ class WikipediaCrawlerWithCMAB:
             remaining_memory = self.size_budget - total_downloaded_size  # In bytes
 
             # If remaining memory is too small, stop all further exploration
-            if remaining_memory < 5 * 1024:  # Arbitrary threshold of 5 KiB
+            if remaining_memory < 4 * 1024:  # threshold of 4 KiB
                 print(f"Stopping all exploration. Remaining memory is too small: {remaining_memory / 1024:.2f} KiB")
-                break  # Stop the BFS if memory is too low
+                break  
 
-            # Calculate URL similarity to the subject
-            # url_similarity = agent.calculate_url_similarity(uri)
-            # if url_similarity < 0.3:  # Arbitrary threshold for URL similarity
-            #     # print(f"Skipping page {uri} due to low URL similarity ({url_similarity:.2f})")
-            #     metrics['skipped_count'] += 1
-                
-
+            # Calculate URL (title) similarity to the subject
+            url_similarity = agent.calculate_url_similarity(uri)
+            print(f"Title similarity for {uri}: {url_similarity}")
 
             # Fetch the content of the page
             soup = self.fetch_page_content(uri)
             if not soup:
-                continue  # Skip this page if it couldn't be fetched
+                continue  
 
             page_text = soup.get_text()
             page_size = self.get_page_size(page_text)
 
             # If the page is too large to fit into remaining memory, skip downloading it
             if page_size > remaining_memory:
-                print(f"Skipping page {uri} (size: {page_size / 1024:.2f} KiB) due to insufficient remaining memory: {remaining_memory / 1024:.2f} KiB")
                 metrics['skipped_count'] += 1
                 continue
 
-            # Calculate similarity to the subject (context)
-            similarity = agent.calculate_similarity(page_text)
+            # Calculate content similarity to the subject (context)
+            content_similarity = agent.calculate_similarity(page_text)
 
-            # Get the action from the agent
-            action = agent.choose_action(page_text)
+            # Get the action from the agent considering both title and content similarity
+            action = agent.choose_action(content_similarity, url_similarity)
 
             # Allow visiting pages but only download them once
             if action == 'download' and uri not in self.visited_uris and total_downloaded_size + page_size <= self.size_budget:
@@ -120,25 +115,37 @@ class WikipediaCrawlerWithCMAB:
                 self.visited_uris.add(uri)
 
                 metrics['downloaded_count'] += 1
-                metrics['downloaded_pages'].append((uri, page_text))  # Track downloaded pages
+                metrics['downloaded_pages'].append((uri, page_text))  
 
                 # Print downloaded size and remaining memory
                 print(f"Downloaded: {uri} (size: {page_size / 1024:.2f} KiB), Remaining memory: {(remaining_memory - page_size) / 1024:.2f} KiB")
 
                 # Track similarity for downloaded pages
-                metrics['similarity_scores'].append(similarity)
+                metrics['similarity_scores'].append(content_similarity)
 
+                # If the page is highly relevant, explore links from it in a DFS manner
+                if url_similarity > high_similarity_threshold :
+                    print(f"High similarity detected ({url_similarity:.2f}) for {uri}. Going deeper...")
+                    sub_links = self.extract_wiki_links(soup)
+                    # Push sub-links with incremented depth to a temporary stack for DFS
+                    stack = [(link, current_depth + 1) for link in sub_links]
+                    
+                    while stack:
+                        sub_uri, sub_depth = stack.pop()  # DFS exploration
+                        if sub_depth <= self.depth_limit and sub_uri not in self.visited_uris:
+                            queue.appendleft((sub_uri, sub_depth))  # Add to the front of the queue
             else:
                 metrics['skipped_count'] += 1
 
             # Extract valid Wikipedia links from the current page
-            links = self.extract_wiki_links(soup)
-            # Enqueue all links found on this page with an incremented depth
-            for link in links:
-                queue.append((link, current_depth + 1))
+            if content_similarity <= high_similarity_threshold:  # Regular BFS for less relevant links
+                links = self.extract_wiki_links(soup)
+                # Enqueue all links found on this page with an incremented depth
+                for link in links:
+                    queue.append((link, current_depth + 1))
 
             # Update rewards and track cumulative rewards
-            agent.update_rewards(action, similarity)
+            agent.update_rewards(action, content_similarity)
             if action == 'download':
                 if metrics['cumulative_rewards']:
                     metrics['cumulative_rewards'].append(metrics['cumulative_rewards'][-1] + agent.rewards[action][-1])
@@ -148,10 +155,8 @@ class WikipediaCrawlerWithCMAB:
                 # If action is 'skip', append the last cumulative reward without change
                 metrics['cumulative_rewards'].append(metrics['cumulative_rewards'][-1])
 
-
-
-
     #-----------------------------------------------------------
+    # The function to run epsilon_greedy
     def run_epsilon_greedy(self, epsilon, epsilon_decay, min_epsilon):
         print(".................................Running Epsilon-Greedy Agent.................................")
         epsilon_greedy_agent = EpsilonGreedyAgent(self.subject, epsilon, epsilon_decay, min_epsilon)
@@ -159,6 +164,7 @@ class WikipediaCrawlerWithCMAB:
         print(f"\nEpsilon-Greedy Agent: Downloaded {self.metrics_eg['downloaded_count']} pages.")
 
     #-----------------------------------------------------------
+    # The function to run ucb
     def run_ucb(self):
         print(".................................Running UCB Agent.................................")
         ucb_agent = UCBAgent(self.subject)
@@ -166,6 +172,18 @@ class WikipediaCrawlerWithCMAB:
         print(f"\nUCB Agent: Downloaded {self.metrics_ucb['downloaded_count']} pages.")
 
     #-----------------------------------------------------------
+    # Ploting and Saving the plots (Do not show)
     def plot_results(self):
         save_plots(self.metrics_eg, self.metrics_ucb)
+
+
+
+    #-------------------------------------------------------------
+    # The function to show the downloaded results. 
+    def display_downloaded_pages(self):
+        print("\n--- Downloaded Pages Summary ---")
+        for i, (uri, content) in enumerate(self.metrics_eg['downloaded_pages'], start=1):
+            print(f"{i}. Topic: {uri}")
+            print(f"   Content (first 500 characters):\n   {content[:500]}")
+            print("-" * 80)
 
